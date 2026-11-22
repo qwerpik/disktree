@@ -8,9 +8,12 @@ use disktree_core::scan_threads::ScanThreads;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PowerEfficiency {
     Miser,
-    #[default]
     Balanced,
     Aggressive,
+    /// The default: a scan is over in about a second, so it takes every
+    /// CPU. On a 12-thread desktop a whole disk of 3 million files took
+    /// 0.96 s on 12 workers and 1.97 s on Balanced's 4 (warm cache).
+    #[default]
     DrainMyBattery,
 }
 
@@ -192,7 +195,10 @@ mod tests {
     fn saved_choice_survives_replacement_and_bad_data_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config/power-efficiency");
-        assert_eq!(load(&path).expect("missing"), PowerEfficiency::Balanced);
+        assert_eq!(
+            load(&path).expect("missing"),
+            PowerEfficiency::DrainMyBattery
+        );
         for preset in PowerEfficiency::ALL {
             save(&path, preset).expect("save");
             assert_eq!(load(&path).expect("load"), preset);

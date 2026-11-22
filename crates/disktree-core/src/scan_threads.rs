@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// A scan crossing several volumes shares this budget; separate scans do not.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanThreads {
-    /// Fixed scan workers, capped by available CPUs; `usize::MAX` uses the
+    /// Fixed scan workers, capped at four per CPU; `usize::MAX` uses the
     /// shared platform-default pool. With `adaptive`, maximum admitted directory
     /// jobs instead, including jobs awaiting a Rayon worker.
     pub max_threads: usize,

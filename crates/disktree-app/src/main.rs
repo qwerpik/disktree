@@ -83,8 +83,8 @@ options:
                         filesystems mounted below PATH (local only; off by default)
   -d, --depth N         how many levels to draw at once (1-6, default 3)
       --power-efficiency PRESET
-                        miser, balanced (default), aggressive, drain-my-battery
-      --scan-threads N  fixed scan workers, capped by available CPU count
+                        miser, balanced, aggressive, drain-my-battery (default)
+      --scan-threads N  fixed scan workers, up to 4 per CPU
       --adaptive-threads
                         experimental adaptive admission (opt-in)
       --fixed-threads   disable adaptive admission and CPU governor
@@ -115,7 +115,9 @@ fn run() -> Result<()> {
             |path| power::load(&path),
         )
         .unwrap_or_else(|error| {
-            eprintln!("Cannot load Power Efficiency: {error}; using Balanced");
+            eprintln!(
+                "Cannot load Power Efficiency: {error}; using Drain My Battery"
+            );
             power::PowerEfficiency::default()
         });
     let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
@@ -536,10 +538,7 @@ mod argument_tests {
     #[test]
     fn adaptive_budget_and_fixed_override_are_explicit() {
         let args = parse_args(arguments(&[])).expect("defaults");
-        assert_eq!(
-            args.options.threads.max_threads,
-            4.min(power::cpu_threads())
-        );
+        assert_eq!(args.options.threads.max_threads, power::cpu_threads());
         assert!(!args.options.threads.adaptive);
         let args = parse_args(arguments(&[
             "--scan-threads",

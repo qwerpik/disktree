@@ -350,10 +350,12 @@ impl Seen {
     }
 }
 
-/// Levels whose subtrees are aggregated in parallel. A top level already
-/// splits a disk into enough work for every thread; below it a parallel
-/// frame per level would only cut the depth that fits in a worker's stack.
-pub(crate) const PARALLEL_LEVELS: usize = 4;
+/// Levels whose subtrees are aggregated in parallel. Deep enough that one
+/// heavy branch is still split: on a disk where `~/.local` holds a
+/// third of 3 million files, four levels left it to one thread, and eight
+/// took aggregation from 55 ms to 33 ms. Deeper, a parallel frame per level
+/// would only cut the depth that fits in a worker's stack.
+pub(crate) const PARALLEL_LEVELS: usize = 8;
 
 fn aggregate_at(
     node: &mut Node,

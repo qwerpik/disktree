@@ -1178,7 +1178,7 @@ impl Disktree {
             None
         } else {
             // On the current preset, or the nearest one below it that this
-            // machine offers: a custom count starts from Balanced.
+            // machine offers: a custom count starts from the default.
             let current = self.power_choice.unwrap_or_default() as usize;
             (0..=current)
                 .rev()
@@ -1292,11 +1292,28 @@ impl Disktree {
     }
 
     fn poll_scan(epoch: u64, cx: &Context<'_, Self>) {
+        const TICK: Duration = Duration::from_millis(110);
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(110))
-                    .await;
+                // A local walk wakes the poller the moment its tree is
+                // ready, rather than on the next tick: up to a tenth of a
+                // second sooner on screen. A remote one ticks, and so does
+                // every test: they drive `poll_scan_once` themselves on the
+                // test clock, which a real wait would not respect.
+                let ready = this
+                    .update(cx, |this, _| {
+                        this.scan.as_ref().map(ScanHandle::ready)
+                    })
+                    .ok()
+                    .flatten()
+                    .filter(|_| !cfg!(test));
+                if let Some(ready) = ready {
+                    cx.background_executor()
+                        .spawn(async move { ready.wait(TICK) })
+                        .await;
+                } else {
+                    cx.background_executor().timer(TICK).await;
+                }
                 let keep_going = this
                     .update(cx, |this, cx| this.poll_scan_once(epoch, cx))
                     .unwrap_or(false);

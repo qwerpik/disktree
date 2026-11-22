@@ -12,6 +12,8 @@ pub mod export;
 pub mod filter;
 pub mod identity;
 pub mod insights;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]

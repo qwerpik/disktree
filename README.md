@@ -16,6 +16,60 @@ Built with [GPUI](https://gpui-kit.com/) through
 [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
 Omarchy theme and behaves like the rest of the desktop.
 
+## This fork: faster whole-disk scans on Linux
+
+A fork of [tobi/disktree](https://github.com/tobi/disktree) with one goal:
+open on a whole Linux disk and have the treemap up in about a second.
+Measured on a Ryzen 5 5600X (12 threads), btrfs on NVMe, 3.2 million
+entries across `/` and its subvolumes, warm cache, time shown in the app:
+
+| | upstream | this fork |
+| --- | --- | --- |
+| `disktree --disk` | 0.3 s, but only `/`: 51 GB of 840 GB used | **0.9–1.0 s, the whole disk** |
+| `/home` (2.8 M entries), then `/` | 1.8 s + 0.3 s, two scans | one scan, **0.9–1.0 s** |
+| `du -sx` over the same mounts | 7.2 s | |
+
+What changed:
+
+- **The whole disk is the whole disk.** On Linux a scan of `/` walks into
+  the Btrfs subvolumes of the same device (`@home` at `/home`, `@log`,
+  `@pkg`, …), which share its free space. Upstream stops at every mount,
+  so on Omarchy `--disk` missed `/home`. Snapshot subvolumes and second
+  views of the same directory still stay out, so nothing is counted twice.
+  This is the rule the free-space meter already used.
+- **Every CPU by default.** The default Power Efficiency preset is now
+  Drain My Battery (all CPU threads) instead of Balanced (4). A warm scan
+  is CPU-bound in the kernel's `statx`, so it scales with threads up to
+  the CPU count. `--scan-threads` accepts up to 4 per CPU, for slow or
+  cold storage.
+- **A leaner Linux listing** (`crates/disktree-core/src/linux.rs`):
+  `getdents64` into a reused buffer and one `statx` per leaf for only the
+  six fields used, with one allocation per entry instead of three.
+- **No wait for the next tick.** The window learns the scan has ended the
+  moment it does, rather than on its next 110 ms poll.
+- **Faster finish.** Size totals and kinds are computed in parallel eight
+  levels deep instead of four, so one heavy branch such as
+  `~/.local` is no longer left to one thread (97 ms → 57 ms).
+
+What is left is mostly the kernel: `examples/lean_walk.rs`, a walk that
+does nothing but list and `statx`, takes 0.78 s on the same disk.
+
+Install: download `disktree-x86_64-linux` from this fork's
+[releases](../../releases), then
+`install -m755 disktree-x86_64-linux ~/.local/bin/disktree`. Or build it:
+`cargo build --release -p disktree-app` and copy `target/release/disktree`.
+
+Measure it yourself:
+
+```sh
+cargo build --release -p disktree-core --examples
+target/release/examples/bench_scan / 12    # the real scanner, ROOT THREADS
+target/release/examples/lean_walk / 12     # the floor
+bench/cold.sh                              # cold cache (sudo, drops caches)
+```
+
+macOS and Windows behave as upstream, apart from the default preset.
+
 ## Install
 
 Download `disktree-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the

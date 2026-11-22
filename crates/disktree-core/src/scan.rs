@@ -15,7 +15,7 @@
 //! poll without locking, and cooperative cancellation so a re-scan can abandon
 //! a walk of a large home directory instead of queueing behind it.
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
@@ -215,6 +215,30 @@ impl ScanProgress {
 pub struct ScanHandle {
     pub progress: Arc<ScanProgress>,
     result: Receiver<io::Result<Node>>,
+    ready: ScanReady,
+}
+
+/// Raised once the scan's result can be taken, so a poller can sleep until
+/// then instead of finding out on its next tick.
+#[derive(Clone, Debug, Default)]
+pub struct ScanReady(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl ScanReady {
+    /// Block until the result is ready or `timeout` passes; whether it is.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        let (ready, signal) = &*self.0;
+        let guard = lock(ready);
+        let (guard, _) = signal
+            .wait_timeout_while(guard, timeout, |ready| !*ready)
+            .unwrap_or_else(PoisonError::into_inner);
+        *guard
+    }
+
+    fn raise(&self) {
+        let (ready, signal) = &*self.0;
+        *lock(ready) = true;
+        signal.notify_all();
+    }
 }
 
 /// A subtree already measured, reused by a wider scan instead of walked
@@ -252,6 +276,8 @@ impl ScanHandle {
             volume: OnceLock::new(),
         });
         let (sender, result) = mpsc::channel();
+        let ready = ScanReady::default();
+        let raised = ready.clone();
 
         // The closure owns the sender, so a failed spawn drops it and the
         // receiver reports the failure. Record the real reason alongside it.
@@ -260,14 +286,25 @@ impl ScanHandle {
                 let outcome = scan_blocking(&root, &context);
                 context.progress.finish();
                 let _ = sender.send(outcome);
+                raised.raise();
             },
         );
         if let Err(error) = worker {
             progress.record_error(Path::new("scan worker"), &error);
             progress.finish();
+            ready.raise();
         }
 
-        Self { progress, result }
+        Self {
+            progress,
+            result,
+            ready,
+        }
+    }
+
+    /// What a poller can wait on instead of ticking.
+    pub fn ready(&self) -> ScanReady {
+        self.ready.clone()
     }
 
     /// Take the finished tree, if the walk is done.
@@ -593,13 +630,13 @@ impl Facts {
 }
 
 /// A standard directory entry with its name decoded once, up front.
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 struct Named {
     entry: DirEntry,
     name: Box<str>,
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 impl Listed for Named {
     fn entry_path(&self, _dir: &Path) -> PathBuf {
         self.entry.path()
@@ -636,6 +673,51 @@ impl Listed for Named {
         self.entry.metadata().map(|meta| Directory {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Listed for crate::linux::Entry {
+    fn entry_path(&self, dir: &Path) -> PathBuf {
+        self.path(dir)
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        self.take_name()
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        Ok(match self.kind() {
+            crate::linux::Kind::Link => Listing::Symlink,
+            crate::linux::Kind::Directory => Listing::Directory,
+            crate::linux::Kind::File => Listing::Leaf(NodeKind::File),
+            crate::linux::Kind::Other => Listing::Leaf(NodeKind::Other),
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        let stat = self.stat()?;
+        Ok(Facts {
+            size: if apparent_size {
+                stat.apparent
+            } else {
+                stat.allocated
+            },
+            identity: Some((stat.device, stat.inode)),
+            modified: stat.modified,
+            shared: stat.links > 1,
+        })
+    }
+
+    fn directory(&self) -> io::Result<Directory> {
+        Ok(Directory {
+            device: self.device()?,
+            evicted: false,
         })
     }
 }
@@ -737,7 +819,7 @@ impl Listed for crate::windows::Entry {
 }
 
 /// List a directory the way [`Listed`] describes.
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn list(
     path: &Path,
     _volume: Option<u64>,
@@ -751,6 +833,14 @@ fn list(
             entry,
         })
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn list(
+    path: &Path,
+    _volume: Option<u64>,
+) -> io::Result<std::vec::IntoIter<io::Result<crate::linux::Entry>>> {
+    crate::linux::read_dir(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -860,9 +950,11 @@ fn fixed_pool(threads: ScanThreads) -> io::Result<Option<rayon::ThreadPool>> {
     if threads.adaptive || threads.max_threads == usize::MAX {
         return Ok(None);
     }
+    // Up to four workers per CPU: a worker waiting on a cold SSD uses no
+    // CPU, so more of them can keep more reads in flight.
     let cpus = thread::available_parallelism().map_or(1, usize::from);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max_threads.clamp(1, cpus))
+        .num_threads(threads.max_threads.clamp(1, cpus * 4))
         .thread_name(|index| format!("disktree-scan-{index}"))
         .build()
         .map(Some)
@@ -896,7 +988,16 @@ fn scan_on_pool(
     let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
-        if let Some(foreign) = crate::space::mount_boundaries_for(canonical) {
+        // On Linux a volume is its mount source: the Btrfs subvolumes of one
+        // disk (`@home` at `/home`, `@log`, …) share its free space, so a
+        // scan of `/` walks into them and measures the whole disk. Snapshot
+        // subvolumes stay out, and a second view of the same directory is
+        // in `never_scanned` already, so nothing is counted twice.
+        #[cfg(target_os = "linux")]
+        let foreign = crate::space::foreign_mounts_for(canonical);
+        #[cfg(not(target_os = "linux"))]
+        let foreign = crate::space::mount_boundaries_for(canonical);
+        if let Some(foreign) = foreign {
             let _ = context.foreign_mounts.set(foreign.into_iter().collect());
         }
     }
