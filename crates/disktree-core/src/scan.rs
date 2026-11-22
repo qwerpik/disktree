@@ -97,11 +97,36 @@ pub struct ScanProgress {
     messages: Mutex<Vec<String>>,
     preview_root: OnceLock<PathBuf>,
     preview: Mutex<crate::scan_preview::Builder>,
+    /// Tells this scan's preview batches from an earlier scan's.
+    preview_id: OnceLock<u64>,
     pub(crate) threads: AtomicUsize,
     pub(crate) threads_settled: AtomicBool,
     pub(crate) thread_tuning_complete: AtomicBool,
     pub(crate) system_cpu_limited: AtomicBool,
     pub(crate) worker_transitions: AtomicU64,
+}
+
+/// Directories a worker measures before handing them to the preview.
+const PREVIEW_BATCH_DIRS: u64 = 64;
+/// How stale a worker's part of the preview may get.
+const PREVIEW_BATCH_TIME: std::time::Duration =
+    std::time::Duration::from_millis(50);
+
+/// One worker's preview measure not yet handed over: one scan's, under
+/// one top-level name.
+#[derive(Default)]
+struct PreviewBatch {
+    scan: u64,
+    name: Option<String>,
+    bytes: u64,
+    files: u64,
+    dirs: u64,
+    since: Option<std::time::Instant>,
+}
+
+thread_local! {
+    static PREVIEW_BATCH: std::cell::RefCell<PreviewBatch> =
+        std::cell::RefCell::default();
 }
 
 /// A point-in-time view of [`ScanProgress`].
@@ -128,6 +153,13 @@ impl ScanProgress {
         lock(&self.preview).snapshot()
     }
 
+    /// Hand one directory's measure to the live preview. Each worker
+    /// gathers its own for up to [`PREVIEW_BATCH_DIRS`] directories or
+    /// [`PREVIEW_BATCH_TIME`] under one top-level name, then takes the
+    /// shared lock once: a whole-disk walk finishes 290 000 directories,
+    /// and one lock each across every worker cost about 8 ms. What a worker
+    /// still holds when the walk ends is never shown, as the preview is
+    /// put away then.
     fn preview_add(&self, path: &Path, bytes: u64, files: u64) {
         let Some(root) = self.preview_root.get() else {
             return;
@@ -139,9 +171,47 @@ impl ScanProgress {
             .components()
             .next()
             .map(|part| part.as_os_str().to_string_lossy());
+        let scan = *self.preview_id.get_or_init(|| {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        });
+        PREVIEW_BATCH.with_borrow_mut(|batch| {
+            let same =
+                batch.scan == scan && batch.name.as_deref() == name.as_deref();
+            if !same {
+                if batch.scan == scan && batch.dirs > 0 {
+                    self.preview_flush(batch, path);
+                }
+                *batch = PreviewBatch {
+                    scan,
+                    name: name.map(std::borrow::Cow::into_owned),
+                    ..PreviewBatch::default()
+                };
+            }
+            batch.bytes += bytes;
+            batch.files += files;
+            batch.dirs += 1;
+            let first = batch.since.is_none();
+            let since =
+                *batch.since.get_or_insert_with(std::time::Instant::now);
+            if first
+                || batch.dirs >= PREVIEW_BATCH_DIRS
+                || since.elapsed() >= PREVIEW_BATCH_TIME
+            {
+                self.preview_flush(batch, path);
+            }
+        });
+    }
+
+    fn preview_flush(&self, batch: &mut PreviewBatch, path: &Path) {
         let mut preview = lock(&self.preview);
-        preview.add(name.as_deref(), bytes, files);
+        preview.add(batch.name.as_deref(), batch.bytes, batch.files);
         preview.directory(path);
+        drop(preview);
+        batch.bytes = 0;
+        batch.files = 0;
+        batch.dirs = 0;
+        batch.since = Some(std::time::Instant::now());
     }
 
     pub(crate) fn entries(&self) -> u64 {
@@ -274,6 +344,7 @@ impl ScanHandle {
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
+            seen: Seen::new(),
         });
         let (sender, result) = mpsc::channel();
         let ready = ScanReady::default();
@@ -337,6 +408,7 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
         visited_dirs: Mutex::new(FxHashSet::default()),
         root: Mutex::new(None),
         volume: OnceLock::new(),
+        seen: Seen::new(),
     });
     let node = scan_blocking(root, &context)?;
     progress.finish();
@@ -365,6 +437,18 @@ struct WalkContext {
     /// cannot leave it: every listing takes it instead of asking. See
     /// [`crate::windows::walk_volume`].
     volume: OnceLock<u64>,
+    /// Hardlinks met so far, when the walk totals directories itself.
+    seen: Seen,
+}
+
+impl WalkContext {
+    /// Whether the walk totals each directory as it completes, leaving the
+    /// finish only the kinds. Not when a subtree is reused: it was totalled
+    /// against another scan's hardlinks, and only a pass over the whole
+    /// tree charges a file it shares with the rest exactly once.
+    const fn totals_in_walk(&self) -> bool {
+        self.known.is_none()
+    }
 }
 
 impl WalkContext {
@@ -404,6 +488,26 @@ impl WalkContext {
 
         let kind = match listing {
             Listing::Symlink => {
+                // The listing may have measured the link already: no path
+                // to build and walk again from the root.
+                if !self.options.follow_links
+                    && let Some(facts) =
+                        entry.link_facts(self.options.apparent_size)
+                {
+                    return match facts {
+                        Ok(facts) => Classified::Entry(leaf_node(
+                            entry.take_name(),
+                            NodeKind::Symlink,
+                            &facts,
+                            facts.shared,
+                        )),
+                        Err(error) => {
+                            self.progress
+                                .record_error(&entry.entry_path(dir), &error);
+                            Classified::Skipped
+                        }
+                    };
+                }
                 let path = entry.entry_path(dir);
                 return self.classify_symlink(&path, entry.take_name());
             }
@@ -447,7 +551,8 @@ impl WalkContext {
         // flag, and the device check below wherever the mount table cannot
         // be read, which on macOS is everywhere.
         let directory_cell = std::cell::OnceCell::new();
-        let directory = || directory_cell.get_or_init(|| entry.directory());
+        let directory =
+            || directory_cell.get_or_init(|| entry.directory(&path));
         if EVICTED_IS_KNOWN
             && directory()
                 .as_ref()
@@ -574,8 +679,14 @@ trait Listed {
     fn listing(&self) -> io::Result<Listing>;
     /// Size, identity and age of a leaf.
     fn facts(&self, apparent_size: bool) -> io::Result<Facts>;
-    /// What a directory is, read before the walk enters it.
-    fn directory(&self) -> io::Result<Directory>;
+    /// What a directory is, read before the walk enters it. `path` is the
+    /// entry's own path, for a listing that did not read it.
+    fn directory(&self, path: &Path) -> io::Result<Directory>;
+    /// The link itself, not what it leads to, when the listing measured
+    /// it; `None` sends the walk to read it by path.
+    fn link_facts(&self, _apparent_size: bool) -> Option<io::Result<Facts>> {
+        None
+    }
     /// Hidden by an attribute rather than by a leading dot: on Windows,
     /// where the listing carries it, so `AppData` is hidden as Explorer
     /// hides it. Finder's `UF_HIDDEN` is not asked for: on macOS, hidden
@@ -669,7 +780,7 @@ impl Listed for Named {
             .map(|meta| Facts::of(&meta, apparent_size))
     }
 
-    fn directory(&self) -> io::Result<Directory> {
+    fn directory(&self, _path: &Path) -> io::Result<Directory> {
         self.entry.metadata().map(|meta| Directory {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
@@ -714,11 +825,16 @@ impl Listed for crate::linux::Entry {
         })
     }
 
-    fn directory(&self) -> io::Result<Directory> {
+    fn directory(&self, path: &Path) -> io::Result<Directory> {
         Ok(Directory {
-            device: self.device()?,
+            device: crate::linux::device(path)?,
             evicted: false,
         })
+    }
+
+    fn link_facts(&self, apparent_size: bool) -> Option<io::Result<Facts>> {
+        (self.kind() == crate::linux::Kind::Link)
+            .then(|| self.facts(apparent_size))
     }
 }
 
@@ -758,7 +874,7 @@ impl Listed for crate::macos::Entry {
         })
     }
 
-    fn directory(&self) -> io::Result<Directory> {
+    fn directory(&self, _path: &Path) -> io::Result<Directory> {
         Ok(Directory {
             device: self.device(),
             evicted: self.evicted(),
@@ -806,7 +922,7 @@ impl Listed for crate::windows::Entry {
     /// The device is never consulted: see
     /// [`crate::space::foreign_mounts_for`]. The same answer as
     /// [`device_of`], so the two could only ever agree.
-    fn directory(&self) -> io::Result<Directory> {
+    fn directory(&self, _path: &Path) -> io::Result<Directory> {
         Ok(Directory {
             device: 0,
             evicted: self.evicted(),
@@ -1016,7 +1132,7 @@ fn scan_on_pool(
             if progress.is_cancelled() {
                 return Err(crate::mft::cancelled());
             }
-            let node = finish_tree(node, &context.options, pool);
+            let node = finish_tree(node, &context.options, pool, false);
             // The reader counted every file on the volume; the tree may
             // hold fewer.
             progress.settle(node.files, u64::from(node.dirs), node.bytes);
@@ -1093,7 +1209,12 @@ fn scan_on_pool(
     let node = node.ok_or_else(|| {
         io::Error::other(format!("{} produced no tree", root.display()))
     })?;
-    Ok(finish_tree(node, &context.options, pool))
+    Ok(finish_tree(
+        node,
+        &context.options,
+        pool,
+        context.totals_in_walk(),
+    ))
 }
 
 /// The walk's workers, and the file table reader's. Listing directories
@@ -1205,6 +1326,9 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
 
     match list(&dir.path, context.volume.get().copied()) {
         Ok(entries) => {
+            // A listing read whole (Linux) knows its length: one allocation
+            // instead of a doubling series.
+            leaves.reserve(entries.size_hint().0);
             for entry in entries {
                 if context.cancelled() {
                     break;
@@ -1221,7 +1345,18 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                                     dir.depth + 1,
                                 )));
                             }
-                            Classified::Entry(node) => {
+                            Classified::Entry(mut node) => {
+                                // Charged once however many names it has:
+                                // the first name met keeps the size.
+                                if context.totals_in_walk()
+                                    && context.options.dedup_hardlinks
+                                    && !node.is_dir()
+                                    && node.bytes > 0
+                                    && let Some(key) = node.identity()
+                                    && !context.seen.insert(key)
+                                {
+                                    node.bytes = 0;
+                                }
                                 tally.add(&node);
                                 leaves.push(node);
                             }
@@ -1288,7 +1423,10 @@ fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
     if dir.pending.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
     }
-    let node = dir.build();
+    let mut node = dir.build();
+    if context.totals_in_walk() {
+        crate::tree::total(&mut node, context.options.metric);
+    }
     let Some(parent) = &dir.parent else {
         *lock(&context.root) = Some(node);
         return;
@@ -1299,14 +1437,17 @@ fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
 
 /// Charge a hardlinked file once, derive every aggregate from the result,
 /// then classify. On the walk's pool: the UI's own work on the global pool
-/// must not queue behind a scan finishing.
+/// must not queue behind a scan finishing. `totalled` when the walk did the
+/// first two already (see `WalkContext::totals_in_walk`).
 fn finish_tree(
     mut node: Node,
     options: &ScanOptions,
     pool: &rayon::ThreadPool,
+    totalled: bool,
 ) -> Node {
     pool.install(|| {
-        if options.dedup_hardlinks {
+        if totalled {
+        } else if options.dedup_hardlinks {
             aggregate_deduped(&mut node, options.metric, &Seen::new());
         } else {
             aggregate(&mut node, options.metric);
@@ -1580,6 +1721,7 @@ mod tests {
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
+            seen: Seen::new(),
         });
         let root = Arc::new(PendingDir::new(
             temp.path().to_path_buf(),
@@ -1662,6 +1804,31 @@ mod tests {
             },
         );
         assert_eq!(counted.bytes, 8192);
+    }
+
+    #[test]
+    fn walk_totals_charge_a_link_across_directories_once_and_sort() {
+        // Totalled as each directory completes: the two names land in
+        // different directories, finished on different workers.
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let original = write(root, "a/original.bin", 8192);
+        write(root, "b/small.bin", 512);
+        fs::hard_link(&original, root.join("b/link.bin")).expect("hard link");
+        write(root, "c/deep/er/file.bin", 20_480);
+
+        let tree = scan_dir(root, &options());
+        assert_eq!(tree.bytes, 8192 + 512 + 20_480);
+        assert_eq!(tree.files, 4);
+        assert_eq!(
+            child(&tree, "a").bytes + child(&tree, "b").bytes,
+            8192 + 512,
+            "the shared file is charged to exactly one of its names"
+        );
+        assert_eq!(child(&tree, "c").bytes, 20_480);
+        let sizes: Vec<u64> = tree.children.iter().map(|c| c.bytes).collect();
+        assert!(sizes.windows(2).all(|pair| pair[0] >= pair[1]));
+        assert_eq!(&*tree.children[0].name, "c");
     }
 
     #[test]
@@ -1860,6 +2027,7 @@ mod tests {
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
+            seen: Seen::new(),
         });
         let tree = scan_blocking(root, &context).expect("scan still succeeds");
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));

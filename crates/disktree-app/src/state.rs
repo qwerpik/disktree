@@ -323,6 +323,39 @@ pub struct RunSummary {
 }
 
 /// Everything the app knows and everything it can do.
+/// A scan `main` started before the window existed, so the walk runs while
+/// the GPU and the window come up (about 80 ms on a desktop) instead of
+/// after. Taken by the first local scan of the same root; anything else
+/// leaves it and walks as usual.
+static PRESTARTED: std::sync::Mutex<Option<(PathBuf, ScanHandle, Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Start the first scan of `root` now, ahead of the window.
+pub fn prestart_scan(root: PathBuf, options: ScanOptions) {
+    let handle = ScanHandle::spawn(root.clone(), options);
+    *PRESTARTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((root, handle, Instant::now()));
+}
+
+/// The prestarted scan, if it walks `root`.
+fn take_prestarted(root: &Path) -> Option<(ScanHandle, Instant)> {
+    let mut slot = PRESTARTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slot.take() {
+        Some((path, handle, started)) if path == root => {
+            Some((handle, started))
+        }
+        Some(other) => {
+            other.1.cancel();
+            None
+        }
+        None => None,
+    }
+}
+
 pub struct Disktree {
     /// The directory the tree was scanned from.
     pub root_path: PathBuf,
@@ -1283,10 +1316,16 @@ impl Disktree {
             cx.notify();
             return;
         }
-        self.scan = Some(ScanHandle::spawn(
-            self.root_path.clone(),
-            self.options.clone(),
-        ));
+        let handle = match take_prestarted(&self.root_path) {
+            Some((handle, started)) => {
+                self.scan_started = Some(started);
+                handle
+            }
+            None => {
+                ScanHandle::spawn(self.root_path.clone(), self.options.clone())
+            }
+        };
+        self.scan = Some(handle);
         Self::poll_scan(epoch, cx);
         cx.notify();
     }

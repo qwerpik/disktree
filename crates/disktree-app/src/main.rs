@@ -179,6 +179,10 @@ fn run() -> Result<()> {
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
+    // The window takes a while to come up; the walk need not wait for it.
+    if args.remote.is_none() && !args.choose_root {
+        state::prestart_scan(root.clone(), args.options.clone());
+    }
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)

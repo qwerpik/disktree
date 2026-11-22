@@ -20,7 +20,6 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use rustix::fs::{
     AtFlags, FileType, Mode, OFlags, RawDir, Statx, StatxFlags, makedev,
@@ -87,13 +86,10 @@ pub struct Entry {
     /// a name that is not UTF-8 is shown lossy but must still open.
     exact: Option<Box<[u8]>>,
     kind: Kind,
-    /// A leaf's `statx`, read while the directory was open. Directories
-    /// and links are not asked: the walk opens one and reads the other by
-    /// path.
+    /// A leaf's or a link's own `statx` (not what it leads to), read while
+    /// the directory was open. Directories are not asked: the walk opens
+    /// them.
     stat: Option<Result<Stat, io::Error>>,
-    /// The directory listed, kept by directory entries only, for the rare
-    /// walk that must ask what device one is on.
-    parent: Option<Arc<Path>>,
 }
 
 impl Entry {
@@ -120,8 +116,8 @@ impl Entry {
         self.kind
     }
 
-    /// The leaf's `statx`. A directory or link has none: asking is a bug,
-    /// answered with an error rather than a wrong size.
+    /// The leaf's or link's `statx`. A directory has none: asking is a
+    /// bug, answered with an error rather than a wrong size.
     pub fn stat(&self) -> io::Result<Stat> {
         match &self.stat {
             Some(Ok(stat)) => Ok(*stat),
@@ -132,16 +128,13 @@ impl Entry {
             None => Err(io::Error::other("no statx for this entry")),
         }
     }
+}
 
-    /// The device a directory entry is on, read by path when asked.
-    pub fn device(&self) -> io::Result<u64> {
-        use std::os::unix::fs::MetadataExt as _;
-        let parent = self
-            .parent
-            .as_deref()
-            .ok_or_else(|| io::Error::other("not a directory entry"))?;
-        std::fs::symlink_metadata(self.path(parent)).map(|meta| meta.dev())
-    }
+/// The device `path` is on, read only when the walk must ask: the mount
+/// table could not be read.
+pub fn device(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).map(|meta| meta.dev())
 }
 
 /// List `dir` whole, with a `statx` for every leaf in it.
@@ -154,7 +147,6 @@ pub fn read_dir(
         Mode::empty(),
     )?;
     let mut entries = Vec::new();
-    let mut parent: Option<Arc<Path>> = None;
     BUFFER.with_borrow_mut(|buffer| {
         let mut raw = RawDir::new(&fd, buffer);
         while let Some(next) = raw.next() {
@@ -181,26 +173,22 @@ pub fn read_dir(
                     let kind = asked.as_ref().map_or(Kind::Other, |stat| {
                         kind_of(FileType::from_raw_mode(stat.stx_mode.into()))
                     });
-                    if !matches!(kind, Kind::Directory | Kind::Link) {
+                    if kind != Kind::Directory {
                         stat = Some(asked.map(|stat| Stat::of(&stat)));
                     }
                     kind
                 }
                 _ => Kind::Other,
             };
-            if stat.is_none() && matches!(kind, Kind::File | Kind::Other) {
+            if stat.is_none() && kind != Kind::Directory {
                 stat = Some(statx(&fd, name).map(|stat| Stat::of(&stat)));
             }
             let (name, exact) = decode(name);
-            let parent = (kind == Kind::Directory).then(|| {
-                Arc::clone(parent.get_or_insert_with(|| Arc::from(dir)))
-            });
             entries.push(Ok(Entry {
                 name,
                 exact,
                 kind,
                 stat,
-                parent,
             }));
         }
     });
@@ -268,8 +256,10 @@ mod tests {
         let file = entries[0].stat().expect("stat");
         assert_eq!(file.apparent, 10_000);
         assert_eq!(file.links, 1);
-        assert!(entries[1].stat().is_err());
-        assert!(entries[3].device().is_ok());
+        // The link itself: its target's name, not the target's 10 000 bytes.
+        assert_eq!(entries[1].stat().expect("link").apparent, 4);
+        assert!(entries[3].stat().is_err());
+        assert!(device(&entries[3].path(dir.path())).is_ok());
         assert_eq!(entries[2].name(), "odd\u{fffd}");
         assert!(entries[2].path(dir.path()).exists());
     }

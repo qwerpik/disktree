@@ -376,10 +376,6 @@ fn aggregate_at(
         return;
     }
 
-    let mut bytes = 0;
-    let mut files = 0;
-    let mut dirs: u32 = 1;
-    let mut modified = 0;
     if depth < PARALLEL_LEVELS {
         node.children
             .par_iter_mut()
@@ -389,6 +385,18 @@ fn aggregate_at(
             aggregate_at(child, metric, depth + 1, seen);
         }
     }
+    total(node, metric);
+}
+
+/// One directory's totals from its children, which must already have
+/// theirs, then its children in [`Metric`] order. What [`aggregate`] does at
+/// each directory; the walk calls it as each directory completes, so most
+/// of a tree is finished by the time the walk is.
+pub(crate) fn total(node: &mut Node, metric: Metric) {
+    let mut bytes = 0;
+    let mut files = 0;
+    let mut dirs: u32 = 1;
+    let mut modified = 0;
     for child in &node.children {
         modified = modified.max(child.modified);
         // Saturating: a corrupt volume's file table can claim any size.

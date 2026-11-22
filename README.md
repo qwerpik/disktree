@@ -47,9 +47,21 @@ What changed:
   six fields used, with one allocation per entry instead of three.
 - **No wait for the next tick.** The window learns the scan has ended the
   moment it does, rather than on its next 110 ms poll.
-- **Faster finish.** Size totals and kinds are computed in parallel eight
-  levels deep instead of four, so one heavy branch such as
-  `~/.local` is no longer left to one thread (97 ms → 57 ms).
+- **The walk starts before the window.** The first scan begins as the
+  process starts, while the GPU and the window come up (about 90 ms on
+  the machine above).
+- **Totals as the walk goes.** Each directory is totalled and sorted the
+  moment its last child finishes, on whichever worker finished it, and a
+  hardlink is charged once as it is listed. The pass that did this after
+  the walk is gone; only the kinds are still a pass of their own.
+- **Links measured in the listing.** A symlink's own `statx` comes with
+  the rest of its directory, instead of a second lookup by full path
+  (170 000 of them on the disk above).
+- **Fewer locks.** Each worker hands the live preview its measure every 64
+  directories or 50 ms, instead of taking a shared lock per directory.
+- **Faster finish.** Kinds are worked out in parallel eight levels deep
+  instead of four, so one heavy branch such as `~/.local` is no longer
+  left to one thread.
 
 What is left is mostly the kernel: `examples/lean_walk.rs`, a walk that
 does nothing but list and `statx`, takes 0.78 s on the same disk.
@@ -65,6 +77,8 @@ Measure it yourself:
 cargo build --release -p disktree-core --examples
 target/release/examples/bench_scan / 12    # the real scanner, ROOT THREADS
 target/release/examples/lean_walk / 12     # the floor
+bench/median.sh / 12 9                     # median of 9 runs
+bench/ab.sh OLD_BENCH NEW_BENCH 11         # two builds, interleaved
 bench/cold.sh                              # cold cache (sudo, drops caches)
 ```
 
